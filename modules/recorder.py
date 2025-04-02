@@ -4,9 +4,11 @@ import pickle
 
 RECORDING_FOLDER = "record"
 
+
 def camel_case(s):
     s = sub(r"(_|-)+", " ", s).title().replace(" ", "")
-    return ''.join([s[0].lower(), s[1:]])
+    return "".join([s[0].lower(), s[1:]])
+
 
 class Recorder:
     def __init__(self, childModule):
@@ -31,7 +33,7 @@ class Recorder:
         self.ledger.append(result)
 
         return result
-    
+
     def stop(self, data):
         with open(f"{self.filenamePrefix}.pickle", "wb") as f:
             pickle.dump(self.ledger, f)

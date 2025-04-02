@@ -4,9 +4,11 @@ import pickle
 
 RECORDING_FOLDER = "record"
 
+
 def camel_case(s):
     s = sub(r"(_|-)+", " ", s).title().replace(" ", "")
-    return ''.join([s[0].lower(), s[1:]])
+    return "".join([s[0].lower(), s[1:]])
+
 
 class Replay:
     def __init__(self, moduleName):
@@ -20,7 +22,7 @@ class Replay:
 
         with open(f"{self.filenamePrefix}.pickle", "rb") as f:
             self.ledger = pickle.load(f)
-        
+
         self.currentIndex = 0
         pass
 
@@ -32,6 +34,6 @@ class Replay:
         self.currentIndex += 1
 
         return result
-    
+
     def stop(self, data):
         pass
