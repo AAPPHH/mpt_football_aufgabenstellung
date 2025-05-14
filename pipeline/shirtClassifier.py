@@ -1,166 +1,238 @@
 import numpy as np
-from sklearn.cluster import KMeans
+import cv2
+from collections import deque
 
 class ShirtClassifier:
     """
-    A classifier that splits player shirt colors into two clusters using K-Means (n_clusters=2).
-    Maintains consistency such that:
-    - Team A is always assigned red (BGR = (0, 0, 255))
-    - Team B is always assigned blue (BGR = (255, 0, 0))
+    Shirt color classifier with adaptive calibration and robust labeling.
+
+    This classifier uses histogram peak detection in Lab ab space, feature fusion
+    of Lab ab and HSV, Mahalanobis distance classification, confidence thresholding,
+    and two-level smoothing (median window + EMA). An adaptive inner-crop focuses
+    on cleaner shirt pixels for improved stability under varying lighting.
+
+    Attributes:
+        calib_frames (int): Number of frames to collect before calibration.
+        bins (int): Number of bins for the 2D Lab ab histogram.
+        min_peak_dist (float): Minimum distance between calibration peaks.
+        tau (float): Confidence threshold for uncertain labels.
+        smoothing_window (int): Window size for median smoothing.
+        ema_alpha (float): Alpha parameter for EMA smoothing.
+        eps (float): Small value added for numerical stability.
+        calibrated (bool): Whether calibration has been completed.
+        peaks (list[np.ndarray] or None): Cluster center means after calibration.
+        inv_covs (list[np.ndarray] or None): Inverse covariance matrices of clusters.
+        track_windows (dict[int, deque]): Historical label windows per track ID.
+        track_ema (dict[int, float]): EMA-smoothed label values per track ID.
     """
-
-    def __init__(self):
+    def __init__(self,
+                 calib_frames=150,
+                 bins=32,
+                 min_peak_dist=5.0,
+                 tau=12.0,
+                 smoothing_window=9,
+                 ema_alpha=0.9,
+                 eps=1e-5):
         """
-        Initialize the ShirtClassifier.
+        Initialize a ShirtClassifier instance.
 
-        Attributes:
-            name (str): Name of the module.
-            reference_colors (ndarray or None): Cluster centers from the first 'good' frame (if any).
-            reference_labels (dict or None): A dictionary mapping cluster labels to specific teams.
+        Args:
+            calib_frames (int): Number of frames to collect features before running calibration.
+            bins (int): Number of bins per dimension for the 2D Lab ab histogram.
+            min_peak_dist (float): Minimum Euclidean distance between two calibration peaks in Lab ab.
+            tau (float): Confidence threshold for Mahalanobis distance difference.
+            smoothing_window (int): Size of the median filter window for label smoothing.
+            ema_alpha (float): Smoothing factor (alpha) for exponential moving average.
+            eps (float): Small epsilon added to covariance diagonal for numerical stability.
         """
-        self.name = "Shirt Classifier"
-        self.reference_colors = None  # Save cluster centers from first good frame
-        self.reference_labels = None  # Save label to team mapping
+        self.name = "ShirtClassifier"
+        self.calib_frames = calib_frames
+        self.bins = bins
+        self.min_peak_dist = min_peak_dist
+        self.tau = tau
+        self.smoothing_window = smoothing_window
+        self.ema_alpha = ema_alpha
+        self.eps = eps
+        self._cal_data = []
+        self.calibrated = False
+        self.peaks = None
+        self.inv_covs = None
+        self.track_windows = {}
+        self.track_ema = {}
 
     def start(self, data):
         """
-        Called when the classifier is started.
+        Notify that calibration has not yet started.
 
         Args:
-            data (dict): A dictionary containing relevant data for the start event
-                         (can be empty or contain system-specific parameters).
+            data (dict): Optional data for start event (ignored).
         """
-        print("[INFO] Shirt Classifier wurde gestartet.")
+        print("[INFO] ShirtClassifier: Calibration not started.")
 
     def stop(self, data):
         """
-        Called when the classifier is stopped.
+        Notify that the classifier has stopped.
 
         Args:
-            data (dict): A dictionary containing relevant data for the stop event
-                         (can be empty or contain system-specific parameters).
+            data (dict): Optional data for stop event (ignored).
         """
-        print("[INFO] Shirt Classifier wurde gestoppt.")
+        print("[INFO] ShirtClassifier: Stopped.")
+
+    def _calibrate_peaks(self):
+        """
+        Perform calibration by finding two dominant color peaks in Lab ab space
+        and computing their means and inverse covariances.
+
+        This method updates `self.peaks`, `self.inv_covs`, and sets `self.calibrated`.
+        """
+        if not self._cal_data:
+            return
+        arr = np.vstack(self._cal_data)  # shape (N, 5)
+        ab = arr[:, :2]
+        H, a_edges, b_edges = np.histogram2d(ab[:, 0], ab[:, 1], bins=self.bins)
+        flat = H.flatten()
+        idxs = np.argsort(flat)[::-1]
+        peaks_ab = []
+        for idx in idxs:
+            if flat[idx] <= 0:
+                break
+            ai, bi = divmod(idx, self.bins)
+            a_mid = (a_edges[ai] + a_edges[ai+1]) / 2.0
+            b_mid = (b_edges[bi] + b_edges[bi+1]) / 2.0
+            peaks_ab.append(np.array([a_mid, b_mid]))
+            if len(peaks_ab) == 2:
+                break
+        if len(peaks_ab) < 2 or np.linalg.norm(peaks_ab[0] - peaks_ab[1]) < self.min_peak_dist:
+            print("[WARN] Calibration peaks invalid, continue collecting.")
+            return
+
+        dists = np.linalg.norm(ab[:, None] - np.array(peaks_ab)[None, :], axis=2)
+        labels = np.argmin(dists, axis=1)
+        peaks_full, inv_covs = [], []
+        for i in [0, 1]:
+            pts = arr[labels == i]
+            if pts.shape[0] < 2:
+                print(f"[WARN] Cluster {i} too small; skipping calibration.")
+                return
+            mu = pts.mean(axis=0)
+            cov = np.cov(pts, rowvar=False) + self.eps * np.eye(pts.shape[1])
+            inv_covs.append(np.linalg.inv(cov))
+            peaks_full.append(mu)
+        self.peaks = peaks_full
+        self.inv_covs = inv_covs
+        self.calibrated = True
+        print("[INFO] Calibration complete.")
+        self._cal_data.clear()
 
     def step(self, data):
         """
-        Perform a single step of the classification process by splitting players into two teams
-        (red or blue) based on average shirt color.
+        Classify each tracked object into Team A or Team B based on shirt color.
 
-        The method does the following:
-        1. Retrieves player bounding boxes (tracks) from the data.
-        2. Filters out objects that are not relevant (class not 1 or 2).
-        3. Computes the average color of the top half of each player's bounding box.
-        4. Applies K-Means (k=2) to cluster these average colors.
-        5. Assigns one cluster to "Team A" (red) and the other cluster to "Team B" (blue).
+        Computes features in Lab and HSV, applies Mahalanobis classification,
+        and smooths labels over time.
 
         Args:
-            data (dict): A dictionary containing:
-                - 'image' (numpy.ndarray): The current frame in BGR format.
-                - 'tracks' (ndarray): An array of bounding boxes in (x_center, y_center, w, h) format.
-                - 'trackClasses' (list): A list of class IDs corresponding to each track.
+            data (dict):
+                image (np.ndarray): BGR frame.
+                tracks (np.ndarray): Array of bounding boxes [x_center, y_center, w, h].
+                trackIds (list[int]): Unique identifiers for each track.
+                trackClasses (list[int]): Class IDs (players=1,2).
 
         Returns:
-            dict: A dictionary with the following keys:
-                - 'teamAColor': Tuple of (B, G, R) for team A.
-                - 'teamBColor': Tuple of (B, G, R) for team B.
-                - 'teamClasses': A list with the team assignment for each tracked object:
-                    0 = Not decided / not a player
-                    1 = Player belongs to team A (red)
-                    -1 = Player belongs to team B (blue)
+            dict: {
+                'teamAColor': (B, G, R) tuple for Team A,
+                'teamBColor': (B, G, R) tuple for Team B,
+                'teamClasses': list of labels per track (1=Team A, -1=Team B, 0=undecided)
+            }
         """
-        frame = data.get("image", None)
+        frame = data.get("image")
         tracks = data.get("tracks", np.zeros((0, 4)))
+        track_ids = data.get("trackIds", list(range(len(tracks))))
         track_classes = data.get("trackClasses", [])
-
-        # Fixed team colors (BGR)
-        team_a_color = (0, 0, 255)  # Red
-        team_b_color = (255, 0, 0)  # Blue
-
         team_classes = [0] * len(tracks)
+        teamA_color = (0, 0, 255)
+        teamB_color = (255, 0, 0)
 
-        if frame is None or len(tracks) == 0:
-            return {
-                "teamAColor": team_a_color,
-                "teamBColor": team_b_color,
-                "teamClasses": team_classes,
-            }
+        if frame is None or len(tracks) < 2:
+            return {"teamAColor": teamA_color,
+                    "teamBColor": teamB_color,
+                    "teamClasses": team_classes}
 
-        height, width, _ = frame.shape
-        player_colors = []
-        player_indices = []
+        feats, idxs = [], []
+        h, w = frame.shape[:2]
 
-        for i, (x_center, y_center, w, h) in enumerate(tracks):
+        for i, (xc, yc, tw, th) in enumerate(tracks):
             cls = track_classes[i] if i < len(track_classes) else 0
-            if cls not in [1, 2]:  # If it's not a player
-                team_classes[i] = 0
+            if cls not in [1, 2]:
                 continue
-
-            x1 = int(x_center - w / 2)
-            y1 = int(y_center - h / 2)
-            x2 = int(x_center + w / 2)
-            y2 = int(y_center + h / 2)
-
-            x1 = max(0, x1)
-            y1 = max(0, y1)
-            x2 = min(width - 1, x2)
-            y2 = min(height - 1, y2)
-
+            x1 = max(0, int(xc - tw/2)); y1 = max(0, int(yc - th/2))
+            x2 = min(w-1, int(xc + tw/2)); y2 = min(h-1, int(yc + th/2))
             if x2 <= x1 or y2 <= y1:
-                team_classes[i] = 0
                 continue
-
-            # Take top half of the bounding box to focus on the shirt region
-            tshirt_y2 = y1 + (y2 - y1) // 2
-            roi = frame[y1:tshirt_y2, x1:x2]
+            bw = x2 - x1
+            border_x = min(max(2, int(0.07 * bw)), bw // 4)
+            x1c, x2c = x1 + border_x, x2 - border_x
+            bh = y2 - y1
+            y1c = y1 + int(0.3 * bh)
+            y2c = y1 + int(0.6 * bh)
+            roi = frame[y1c:y2c, x1c:x2c]
             if roi.size == 0:
-                team_classes[i] = 0
                 continue
+            lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
+            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            ab = lab[..., 1:3].reshape(-1, 2)
+            h_vals = hsv[..., 0].astype(np.float32) / 180.0 * 2 * np.pi
+            cos_h = np.cos(h_vals).reshape(-1)
+            sin_h = np.sin(h_vals).reshape(-1)
+            s = hsv[..., 1].astype(np.float32) / 255.0
+            feat = np.array([
+                np.median(ab[:, 0]), np.median(ab[:, 1]),
+                np.median(cos_h), np.median(sin_h), np.median(s)
+            ], dtype=np.float32)
+            feats.append(feat)
+            idxs.append(i)
+            if not self.calibrated:
+                self._cal_data.append(feat)
 
-            avg_color = roi.mean(axis=(0, 1))  # (B, G, R) format
-            player_colors.append(avg_color)
-            player_indices.append(i)
+        if not self.calibrated and len(self._cal_data) >= self.calib_frames:
+            self._calibrate_peaks()
 
-        # If there are fewer than 2 players to cluster, we can't reliably split them into teams
-        if len(player_colors) < 2:
-            return {
-                "teamAColor": team_a_color,
-                "teamBColor": team_b_color,
-                "teamClasses": team_classes,
-            }
+        if not self.calibrated:
+            return {"teamAColor": teamA_color,
+                    "teamBColor": teamB_color,
+                    "teamClasses": team_classes}
 
-        X = np.array(player_colors, dtype=np.float32)
-        kmeans = KMeans(n_clusters=2, random_state=0, n_init="auto").fit(X)
-        labels = kmeans.labels_
-        centers = kmeans.cluster_centers_
+        for j, feat in enumerate(feats):
+            i = idxs[j]
+            tid = track_ids[i]
+            d0 = (feat - self.peaks[0]) @ self.inv_covs[0] @ (feat - self.peaks[0])
+            d1 = (feat - self.peaks[1]) @ self.inv_covs[1] @ (feat - self.peaks[1])
+            conf = abs(d0 - d1)
+            raw_label = 0 if conf < self.tau else (1 if d0 < d1 else -1)
 
-        # Desired colors for teams (BGR)
-        desired_team_a_color = np.array([0, 0, 255], dtype=np.float32)  # Red
-        desired_team_b_color = np.array([255, 0, 0], dtype=np.float32)  # Blue
+            if tid not in self.track_windows:
+                self.track_windows[tid] = deque(maxlen=self.smoothing_window)
+                self.track_ema[tid] = raw_label
+            self.track_windows[tid].append(raw_label)
 
-        dist_to_a = np.linalg.norm(centers - desired_team_a_color, axis=1)
-        dist_to_b = np.linalg.norm(centers - desired_team_b_color, axis=1)
+            nonzero = [x for x in self.track_windows[tid] if x != 0]
+            if len(nonzero) < 3:
+                assign = 0
+            else:
+                med = np.median(self.track_windows[tid])
+                old = self.track_ema.get(tid, med)
+                ema = self.ema_alpha * old + (1 - self.ema_alpha) * med
+                self.track_ema[tid] = ema
+                assign = 1 if ema >= 0 else -1
 
-        # If each center is closer to a unique desired color, use that mapping.
-        # Otherwise, default to cluster 0 = Team A, cluster 1 = Team B.
-        if np.argmin(dist_to_a) != np.argmin(dist_to_b):
-            cluster_for_a = int(np.argmin(dist_to_a))
-            cluster_for_b = int(np.argmin(dist_to_b))
-            label_map = {
-                cluster_for_a: 1,   # Team A (red)
-                cluster_for_b: -1,  # Team B (blue)
-            }
-        else:
-            label_map = {0: 1, 1: -1}
+            team_classes[i] = assign
 
-        for idx, cluster_label in enumerate(labels):
-            track_index = player_indices[idx]
-            team_classes[track_index] = label_map[cluster_label]
+        active = set(track_ids)
+        for tid in list(self.track_windows):
+            if tid not in active:
+                self.track_windows.pop(tid)
+                self.track_ema.pop(tid, None)
 
-        result = {
-            "teamAColor": team_a_color,
-            "teamBColor": team_b_color,
-            "teamClasses": team_classes,
-        }
-
-        return result
+        return {"teamAColor": teamA_color,
+                "teamBColor": teamB_color,
+                "teamClasses": team_classes}

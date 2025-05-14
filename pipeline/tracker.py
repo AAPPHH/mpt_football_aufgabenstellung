@@ -17,7 +17,7 @@ class Tracker:
         max_cosine_distance=0.2,
         embedder="mobilenet",
         embedder_gpu=True,
-        half=False,
+        half=True,
         bgr=True,
     ):
         """
