@@ -1,275 +1,251 @@
 import numpy as np
-from deep_sort_realtime.deepsort_tracker import DeepSort
+from scipy.optimize import linear_sum_assignment
+
+
+class Filter:
+    """
+    Kalman filter for tracking a single object in 2D bounding box coordinates.
+    """
+
+    _next_id = 1
+
+    def __init__(self, z, cls, Q=None, R=None):
+        """
+        Initializes the filter with an initial measurement.
+
+        Args:
+            z (array-like): Initial measurement [x, y, w, h].
+            cls (int): Class label.
+            Q (ndarray, optional): Process noise covariance (6x6).
+            R (ndarray, optional): Measurement noise covariance (4x4).
+        """
+        z = np.asarray(z, dtype=np.float32)
+        self.x = np.zeros((6,), dtype=np.float32)
+        self.x[:4] = z
+        self.x[4:] = 0.0
+
+        P_pos = 10.0
+        P_vel = 1000.0
+        self.P = np.diag([P_pos, P_pos, P_pos, P_pos, P_vel, P_vel]).astype(np.float32)
+
+        self.F = np.eye(6, dtype=np.float32)
+        dt = 1.0
+        self.F[0, 4] = dt
+        self.F[1, 5] = dt
+
+        self.H = np.zeros((4, 6), dtype=np.float32)
+        self.H[0, 0] = 1.0
+        self.H[1, 1] = 1.0
+        self.H[2, 2] = 1.0
+        self.H[3, 3] = 1.0
+
+        self.Q = Q if Q is not None else np.eye(6, dtype=np.float32)
+        self.R = R if R is not None else np.eye(4, dtype=np.float32)
+
+        self.id = Filter._next_id
+        Filter._next_id += 1
+
+        self.cls = cls
+        self.age = 1
+        self.misses = 0
+
+    def predict(self):
+        """Predicts the state ahead one time step."""
+        self.x = self.F.dot(self.x)
+        self.P = self.F.dot(self.P).dot(self.F.T) + self.Q
+
+    def update(self, z):
+        """
+        Updates the state with a new measurement.
+
+        Args:
+            z (array-like): Measurement [x, y, w, h].
+        """
+        z = np.asarray(z, dtype=np.float32)
+        y = z - self.H.dot(self.x)
+        S = self.H.dot(self.P).dot(self.H.T) + self.R
+        K = self.P.dot(self.H.T).dot(np.linalg.inv(S))
+        self.x = self.x + K.dot(y)
+        I = np.eye(6, dtype=np.float32)
+        self.P = (I - K.dot(self.H)).dot(self.P)
+        self.misses = 0
+
+    def increment_age(self):
+        """Increments the track age."""
+        self.age += 1
+
+    def mark_missed(self):
+        """Marks the track as missed (no update)."""
+        self.misses += 1
+
+    def is_deleted(self, max_misses):
+        """
+        Checks if track should be deleted based on misses.
+
+        Args:
+            max_misses (int)
+
+        Returns:
+            bool: True if misses >= max_misses.
+        """
+        return self.misses >= max_misses
+
+    def get_state(self):
+        """
+        Returns current bounding box.
+
+        Returns:
+            ndarray: [x, y, w, h].
+        """
+        return self.x[:4].copy()
+
+    def get_velocity(self):
+        """
+        Returns current velocity estimate.
+
+        Returns:
+            ndarray: [vx, vy].
+        """
+        return self.x[4:].copy()
+
 
 class Tracker:
     """
-    A tracker class that utilizes the DeepSort algorithm to track objects
-    across sequential frames. It maintains internal state for ages, classes,
-    previous positions, and velocities for each track.
+    Multi-object tracker using Kalman filters and Hungarian assignment.
     """
-    
-    def __init__(
-        self,
-        max_iou_distance=0.7,
-        max_age=30,
-        n_init=3,
-        nms_max_overlap=1.0,
-        max_cosine_distance=0.2,
-        embedder="mobilenet",
-        embedder_gpu=True,
-        half=True,
-        bgr=True,
-    ):
-        """
-        Initialize the DeepSort tracker and relevant parameters for tracking.
 
-        Args:
-            max_iou_distance (float): Maximum IoU distance for matching.
-            max_age (int): Maximum number of missed updates for a track before it is deleted.
-            n_init (int): Number of consecutive detections before a track is confirmed.
-            nms_max_overlap (float): Non-Maximum Suppression threshold.
-            max_cosine_distance (float): Maximum cosine distance for appearance matching.
-            embedder (str): The name of the embedder model used for feature extraction.
-            embedder_gpu (bool): Whether to use the GPU for the embedder.
-            half (bool): If True, use FP16 precision where supported.
-            bgr (bool): If True, interpret images as BGR (OpenCV format); otherwise RGB.
-        """
+    def __init__(self):
+        """Initializes the tracker."""
         self.name = "Tracker"
-        self.deepsort = DeepSort(
-            max_iou_distance=max_iou_distance,
-            max_age=max_age,
-            n_init=n_init,
-            nms_max_overlap=nms_max_overlap,
-            max_cosine_distance=max_cosine_distance,
-            embedder=embedder,
-            embedder_gpu=embedder_gpu,
-            half=half,
-            bgr=bgr,
-        )
-
-        self.track_ages = {}
-        self.track_classes = {}
-        self.prev_positions = {}
-        self.track_velocities = {}
+        self.filters = []
+        self.max_misses = 5
+        self.iou_threshold = 0.3
 
     def start(self, data):
         """
-        Start the DeepSort tracker.
-        
+        Starts the tracker, clearing existing tracks.
+
         Args:
-            data (dict): A dictionary potentially containing initialization data.
+            data: Ignored.
         """
-        print("[INFO] DeepSort Tracker wurde gestartet.")
+        self.filters = []
+        Filter._next_id = 1
 
     def stop(self, data):
         """
-        Stop the DeepSort tracker.
-        
-        Args:
-            data (dict): A dictionary potentially containing data for stopping the tracker.
-        """
-        print("[INFO] DeepSort Tracker wurde gestoppt.")
-
-    def _xywh_to_xyxy(self, x_center, y_center, w, h):
-        """
-        Convert bounding box format from (x_center, y_center, w, h) to (x1, y1, x2, y2).
+        Stops the tracker, clearing all tracks.
 
         Args:
-            x_center (float): The x-coordinate of the center of the bounding box.
-            y_center (float): The y-coordinate of the center of the bounding box.
-            w (float): The width of the bounding box.
-            h (float): The height of the bounding box.
-
-        Returns:
-            list: A list [x1, y1, x2, y2] representing the bounding box.
+            data: Ignored.
         """
-        x1 = x_center - w / 2
-        y1 = y_center - h / 2
-        x2 = x_center + w / 2
-        y2 = y_center + h / 2
-        return [x1, y1, x2, y2]
-
-    def _xyxy_to_xywh(self, x1, y1, x2, y2):
-        """
-        Convert bounding box format from (x1, y1, x2, y2) to (x_center, y_center, w, h).
-
-        Args:
-            x1 (float): The left coordinate of the bounding box.
-            y1 (float): The top coordinate of the bounding box.
-            x2 (float): The right coordinate of the bounding box.
-            y2 (float): The bottom coordinate of the bounding box.
-
-        Returns:
-            list: A list [x_center, y_center, w, h] representing the bounding box.
-        """
-        w = x2 - x1
-        h = y2 - y1
-        x_center = x1 + w / 2
-        y_center = y1 + h / 2
-        return [x_center, y_center, w, h]
-
-    def compute_iou(self, boxA, boxB):
-        """
-        Compute the Intersection-over-Union (IoU) for two bounding boxes in (x1, y1, x2, y2) format.
-
-        Args:
-            boxA (list): The first bounding box [x1, y1, x2, y2].
-            boxB (list): The second bounding box [x1, y1, x2, y2].
-
-        Returns:
-            float: The IoU value between 0.0 and 1.0.
-        """
-        xA = max(boxA[0], boxB[0])
-        yA = max(boxA[1], boxB[1])
-        xB = min(boxA[2], boxB[2])
-        yB = min(boxA[3], boxB[3])
-        interW = max(0, xB - xA)
-        interH = max(0, yB - yA)
-        interArea = interW * interH
-        if interArea == 0:
-            return 0.0
-        boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
-        boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
-        iou = interArea / float(boxAArea + boxBArea - interArea)
-        return iou
+        self.filters = []
 
     def step(self, data):
         """
-        Process a single frame of detections and update tracking information.
-
-        This method uses the DeepSort tracker to update the states of tracked objects
-        based on current frame detections. It calculates velocities, ages, and class
-        information for each tracked object.
+        Processes a frame of detections.
 
         Args:
-            data (dict): A dictionary containing:
-                - 'detections' (list): List of detections in (x_center, y_center, w, h) format.
-                - 'classes' (list): List of class IDs corresponding to each detection.
-                - 'image' (ndarray): The current frame (image) in numpy array format.
-                - 'teamClasses' (list, optional): Additional class information for teams.
+            data (dict): Contains 'detections' (Nx4) and 'classes' (N).
 
         Returns:
-            dict: A dictionary with tracking results containing:
-                - "tracks": Nx4 array of current positions in (x_center, y_center, w, h) format.
-                - "trackVelocities": Nx2 array of velocity vectors for each track.
-                - "trackAge": List of ages corresponding to each track.
-                - "trackClasses": List of class IDs for each tracked object.
-                - "trackIds": List of assigned track IDs.
-                - "teamClasses": List of team class IDs (if provided).
+            dict: 'tracks', 'trackVelocities', 'trackAge', 'trackClasses', 'trackIds'.
         """
-        detections = data.get("detections", [])
-        classes = data.get("classes", [])
-        frame = data.get("image", None)
+        dets = np.asarray(data.get("detections", []), dtype=np.float32)
+        classes = list(data.get("classes", []))
 
-        if frame is None:
-            print("[WARN] Kein Frame übergeben, ReID nicht möglich!")
-            return {
-                "tracks": np.zeros((0, 4)),
-                "trackVelocities": np.zeros((0, 2)),
-                "trackAge": [],
-                "trackClasses": [],
-                "trackIds": [],
-                "teamClasses": [],
-            }
+        for f in self.filters:
+            f.predict()
 
-        if len(detections) == 0:
-            return {
-                "tracks": np.zeros((0, 4)),
-                "trackVelocities": np.zeros((0, 2)),
-                "trackAge": [],
-                "trackClasses": [],
-                "trackIds": [],
-                "teamClasses": [],
-            }
+        T = len(self.filters)
+        D = dets.shape[0]
+        matches = []
+        unmatched_tracks = list(range(T))
+        unmatched_dets = list(range(D))
 
-        raw_detections = []
-        detection_boxes = []
-        detection_classes = []
-        for i, det in enumerate(detections):
-            x_center, y_center, w, h = det
-            x1, y1, x2, y2 = self._xywh_to_xyxy(x_center, y_center, w, h)
-            left, top = x1, y1
-            ww = x2 - x1
-            hh = y2 - y1
-            conf = 1.0
-            cls_val = int(classes[i]) if i < len(classes) else 0
-            raw_detections.append(([left, top, ww, hh], conf, cls_val))
-            detection_boxes.append([x1, y1, x2, y2])
-            detection_classes.append(cls_val)
+        if T > 0 and D > 0:
+            cost_matrix = np.zeros((T, D), dtype=np.float32)
+            for i, f in enumerate(self.filters):
+                tb = f.get_state()
+                for j in range(D):
+                    cost_matrix[i, j] = 1.0 - self._iou(tb, dets[j])
+            row_ind, col_ind = linear_sum_assignment(cost_matrix)
 
-        outputs = self.deepsort.update_tracks(raw_detections, frame=frame)
+            unmatched_tracks = list(range(T))
+            unmatched_dets = list(range(D))
+            matches = []
+            for r, c in zip(row_ind, col_ind):
+                if cost_matrix[r, c] <= 1.0 - self.iou_threshold:
+                    matches.append((r, c))
+                    unmatched_tracks.remove(r)
+                    unmatched_dets.remove(c)
 
-        tracked_positions = []
-        tracked_velocities = []
-        tracked_ages = []
-        tracked_classes = []
-        tracked_ids = []
+        for r, c in matches:
+            f = self.filters[r]
+            f.update(dets[c])
+            f.cls = classes[c]
+            f.increment_age()
 
-        for t in outputs:
-            if not t.is_confirmed() or t.time_since_update > 0:
-                continue
+        for idx in unmatched_tracks:
+            f = self.filters[idx]
+            f.mark_missed()
+            f.increment_age()
 
-            track_id = t.track_id
-            l, t_, r, b = t.to_tlbr()
-            x_center, y_center, w_, h_ = self._xyxy_to_xywh(l, t_, r, b)
+        for j in unmatched_dets:
+            nf = Filter(dets[j], classes[j])
+            self.filters.append(nf)
 
-            if track_id not in self.track_ages:
-                self.track_ages[track_id] = 1
-            else:
-                self.track_ages[track_id] += 1
+        self.filters = [f for f in self.filters if not f.is_deleted(self.max_misses)]
 
-            best_iou = 0.0
-            best_cls = 0
-            track_box = [l, t_, r, b]
-            for i, det_box in enumerate(detection_boxes):
-                iou = self.compute_iou(track_box, det_box)
-                if iou > best_iou:
-                    best_iou = iou
-                    best_cls = detection_classes[i]
-            if best_iou > 0.3:
-                cls_in_tracker = best_cls
-            else:
-                cls_in_tracker = 0
-
-            self.track_classes[track_id] = cls_in_tracker
-
-            if track_id in self.prev_positions:
-                px_center, py_center, _, _ = self.prev_positions[track_id]
-                vx = x_center - px_center
-                vy = y_center - py_center
-                self.track_velocities[track_id] = (vx, vy)
-            else:
-                self.track_velocities[track_id] = (0.0, 0.0)
-
-            self.prev_positions[track_id] = (x_center, y_center, w_, h_)
-
-            tracked_positions.append([x_center, y_center, w_, h_])
-            tracked_velocities.append(self.track_velocities[track_id])
-            tracked_ages.append(self.track_ages[track_id])
-            tracked_classes.append(cls_in_tracker)
-            tracked_ids.append(track_id)
-
-        team_classes = data.get("teamClasses", [])
-        if len(team_classes) == 0:
-            team_classes = [0] * len(tracked_positions)
-
-        if len(tracked_positions) == 0:
-            tracks = np.zeros((0, 4))
+        if self.filters:
+            tracks = np.stack([f.get_state() for f in self.filters]).astype(np.float32)
+            trackVelocities = np.stack([f.get_velocity() for f in self.filters]).astype(np.float32)
         else:
-            tracks = np.array(tracked_positions).reshape(-1, 4)
+            tracks = np.empty((0, 4), dtype=np.float32)
+            trackVelocities = np.empty((0, 2), dtype=np.float32)
 
-        if len(tracked_velocities) == 0:
-            track_velocities = np.zeros((0, 2))
-        else:
-            track_velocities = np.array(tracked_velocities).reshape(-1, 2)
+        trackAge = [f.age for f in self.filters]
+        trackClasses = [f.cls for f in self.filters]
+        trackIds = [f.id for f in self.filters]
 
-        results = {
+        return {
             "tracks": tracks,
-            "trackVelocities": track_velocities,
-            "trackAge": tracked_ages,
-            "trackClasses": tracked_classes,
-            "trackIds": tracked_ids,
-            "teamClasses": team_classes,
+            "trackVelocities": trackVelocities,
+            "trackAge": trackAge,
+            "trackClasses": trackClasses,
+            "trackIds": trackIds,
         }
 
-        return results
+    @staticmethod
+    def _iou(b1, b2):
+        """
+        Computes IoU for two bounding boxes in [x, y, w, h].
+
+        Args:
+            b1, b2 (array-like): Bounding boxes.
+        Returns:
+            float: IoU value.
+        """
+        x11 = b1[0] - b1[2] / 2
+        y11 = b1[1] - b1[3] / 2
+        x12 = b1[0] + b1[2] / 2
+        y12 = b1[1] + b1[3] / 2
+
+        x21 = b2[0] - b2[2] / 2
+        y21 = b2[1] - b2[3] / 2
+        x22 = b2[0] + b2[2] / 2
+        y22 = b2[1] + b2[3] / 2
+
+        xi1 = max(x11, x21)
+        yi1 = max(y11, y21)
+        xi2 = min(x12, x22)
+        yi2 = min(y12, y22)
+
+        wi = max(0.0, xi2 - xi1)
+        hi = max(0.0, yi2 - yi1)
+        inter = wi * hi
+
+        a1 = b1[2] * b1[3]
+        a2 = b2[2] * b2[3]
+        union = a1 + a2 - inter
+
+        return inter / union if union > 0 else 0.0

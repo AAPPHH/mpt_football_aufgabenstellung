@@ -7,7 +7,7 @@ class OpticalFlow:
     It can optionally scale and mirror the input frames and supports CUDA-accelerated flow.
     """
 
-    def __init__(self, scale_factor=0.5, mirror=True, use_gpu=False):
+    def __init__(self, scale_factor=0.5, mirror=True):
         """
         Initialize the optical flow computation with given parameters.
 
@@ -21,12 +21,6 @@ class OpticalFlow:
         self.prev_gray = None
         self.scale_factor = scale_factor
         self.mirror = mirror
-        self.use_gpu = use_gpu
-
-        if self.use_gpu:
-            self.gpu_flow = cv.cuda_FarnebackOpticalFlow.create(
-                5, 0.5, False, 15, 3, 5, 1.2, 0
-            )
 
     def start(self, data):
         """
@@ -92,15 +86,9 @@ class OpticalFlow:
             self.prev_gray = gray
             return {"opticalFlow": np.array([0, 0])}
 
-        if self.use_gpu:
-            d_prev_gray = cv.cuda_GpuMat(self.prev_gray)
-            d_gray = cv.cuda_GpuMat(gray)
-            d_flow = self.gpu_flow.calc(d_prev_gray, d_gray, None)
-            flow = d_flow.download()
-        else:
-            flow = cv.calcOpticalFlowFarneback(
-                self.prev_gray, gray, None, 0.5, 3, 15, 3, 5, 1.2, 0
-            )
+        flow = cv.calcOpticalFlowFarneback(
+            self.prev_gray, gray, None, 0.5, 3, 15, 3, 5, 1.2, 0
+        )
 
         avg_flow = np.mean(flow, axis=(0, 1)) / self.scale_factor
 
